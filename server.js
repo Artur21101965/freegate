@@ -164,6 +164,10 @@ const autoUpdate = require('./lib/autoupdate');
 const AUTO_UPDATE = (config.autoUpdate && typeof config.autoUpdate === 'object') ? config.autoUpdate : {};
 const diagMonitor = require('./lib/diagmonitor');
 const DIAG_MONITOR = (config.diagMonitor && typeof config.diagMonitor === 'object') ? config.diagMonitor : { enabled: true, intervalMs: 30 * 60 * 1000 };
+// Прокси-компакция по умолчанию ВЫКЛЮЧЕНА: её делает клиент (opencode/BigPickle),
+// который знает структуру диалога. Прокси не переписывает контент — иначе агент
+// теряет рабочий контекст и «не продолжает». Включить: {"compacter":{"enabled":true}}.
+const COMPACTER_ENABLED = !!(config.compacter && config.compacter.enabled);
 const modelManager = new ModelManager({
   dbPath: path.join(__dirname, 'models-db.json'),
   catalogPath: path.join(__dirname, 'providers.json'),
@@ -430,7 +434,12 @@ async function handleChatCompletion(req, res, body) {
   // Runs AFTER the vision pipeline (images already converted to text above).
   // Skipped in window-upgrade mode — the big provider takes the raw context.
   if (Array.isArray(body.messages)) measure.origTokens = estimateTokens(body.messages);
-  if (Array.isArray(body.messages) && body.messages.length > 0 && !windowUpgraded) {
+  // Прокси-компакция ОПЦИОНАЛЬНА (config.compacter.enabled, по умолчанию false).
+  // Компактит сам клиент (opencode auto-compaction / BigPickle) — он знает
+  // смысловую структуру диалога и сохраняет «что осталось сделать». Прокси лишь
+  // роутит и не должен переписывать контент — иначе агент теряет нить.
+  // Окно-роутинг (ниже) остаётся всегда: выбирает провайдера под размер запроса.
+  if (COMPACTER_ENABLED && !windowUpgraded) {
     body.messages = await prepareMessages(body.messages, { contextWindow: PROVIDERS[targetProviderKey]?.context_window || 0 });
   }
   // Контекстная телеметрия: токены после компакции + доля системного промпта.
