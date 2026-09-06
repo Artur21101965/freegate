@@ -1,6 +1,6 @@
 {
   "name": "freegate",
-  "version": "0.6.28",
+  "version": "0.6.29",
   "description": "Free multi-provider LLM gateway with automatic failover. One OpenAI-compatible endpoint routes to many free models (Groq, Mistral, Gemini, NIM, OpenRouter, ZAI, Cerebras, DeepSeek and more). Never pay for LLMs.",
   "license": "MIT",
   "bin": {
