@@ -1,79 +1,85 @@
-# Freegate — Project Memory
+# Freegate — Project Memory (обновлено 0.6.29)
 
-Ключевые решения и знания. Читай перед изменениями в прокси.
+Актуальное состояние. Читай ПЕРЕД изменениями. Историю прошлых итераций сознательно сжал — важно текущее.
 
 ## Архитектура
-- **Прокси**: Node.js, zero-dependency, модули в `lib/` (cache, clean, compactor, dashboard, health, logger, memory, memory-store, providers, rateLimit, vision)
-- **Провайдеры**: каталог в `providers.json`, пользовательские в `config.json` (overlay). Ключи ТОЛЬКО в `.env`
-- **Память**: `memStore` (lib/memory.js + memory-store.js) — векторные факты в `memory.json`, автосейв 60с + на SIGTERM
-- **Отдельно**: прокси логика (server.js + lib/) и генератор шортс (tools/, Python)
+- **Прокси** Node.js zero-dep. Ядро: `server.js` (роутинг/стрим/выбор провайдера) + `lib/*`.
+- **Провайдеры**: каталог `providers.json` (65 моделей), пользовательские — `config.json` (overlay). Ключи ТОЛЬКО в `.env` (gitignored). `state.json`/`models-db.json`/`cache.json`/`diag_history.json` — runtime (gitignored).
+- **Алиасы**: `tier-s` (быстрая), `tier-splus`/`tier-l` (мощная), `tier-xl` (окно). Маппинг в `lib/providers.js` MODEL_MAP. Актуально (0.6.29): `tier-splus→or-dots-3`, `tier-xl→or-dots-3`, `tier-l→or-minimax-m3-free`, `tier-s→mistral-codestral`.
+- **Отдельно**: генератор шортс (`tools/`, Python) — не связан с роутингом.
 
-## Ключевые решения
-- **Health-проверки через `/models`** (не реальный запрос) — иначе сжигаются дневные лимиты провайдеров (Groq лимитит по запросам/день). НЕ возвращать обратно без крайней нужды.
-- **Ретраи не при 429/401/404** — только жгут лимит.
-- **Кап latency 60s** — зависшие запросы не должны «отравлять» выбор провайдера.
-- **tier-алиасы маршрутизируются на целевую модель первой** — иначе агент попадает на Nemotron-120b (думает вслух, слитный ответ).
-- **Провайдеры с >20 ошибок сегодня** почти исключаются из выбора (восстанавливаются на следующий день).
-- **Стриминг кэшируется** — повторные промпты из кэша за ~50ms.
-- **Семантический кэш** (lib/semcache.js): char-trigram dice 0.85 — ловит перефразы только ДЛИННЫХ диалогов; короткие (0.80-0.84) неотличимы от опасных подмен фактов, сознательно не кэшируются. `provider: semcache` в логе.
-- **Контекстная телеметрия** (lib/contextstats.js): бакеты `час|провайдер`, aggregates в `stats.context` (state.json, автосейв 30с). Экспозиция: `context` в `/health`, `context_summary` в `/v1/stats`, карточка «Контекст» в dashboard, CLI `node tools/context-diag.js --hours N [--json]`. Статус: `OVERFLOW > SYS_HEAVY > NARROW > OK`. Один measure на запрос (записывается только в терминальных точках: кэш/успех/стрим/финальные ошибки).
-- **Окно-осознанный авто-апгрейд** (server.js + lib/routing.js `needsWindowUpgrade`): запрос с `est > win×1.5` (WINDOW_FIT_FACTOR) не влезает в окно target → компакция пропускается, target исключается из цепочки, провайдер выбирается из capable-пула (`win >= requestTokens || win === 0`). Считается `upgradedCount` в телеметрии.
-- **Компакция** (lib/compactor.js): порог 60k токенов, `CHARS_PER_TOKEN=1.5` (намеренно консервативно; opencode «264k» ≈ ~2× прокси-оценки), keep_recent 30k. Оценка по символам, сжимает слишком большие диалоги.
-- **Долговременная память**: при компакции summarizer отдаёт JSON `{summary, facts}` — факты автоматически в `memory.json` (0 доп. LLM-вызовов). Перед кэшем запрос анализируется, релевантные факты добавляются **user-сообщением** `[Память: ...]` после system (кэш-ключ строится из user → разные факты = разные ключи, без отравления кэша).
-- **Productive Agent Layer** (30.08): инженерная дисциплина в запросе — `lib/taskclassify.js` классифицирует задачу (coding/reasoning/search/chat без LLM), `lib/methodology.js` вставляет короткий системный промпт-методолог после памяти/до кэша (system игнорируется normalize → кэш не отравляется), `server.js` бустит вес моделей под категорию. Метрика `tasks`/`taskTotal` в contextstats → `/health` и `/v1/stats`, карточка «Контекст» + `tools/context-diag.js`. Toggle: `config.methodology.enabled` (по умолчанию true). Промпты настраиваются: `config.methodology.prompts.{category}` переопределяет дефолт для категории. Тексты-методологи — производный сжатый текст по мотивам superpowers (MIT, атрибуция в `docs/methodology/README.md`).
-- **Самообновляющаяся база моделей** (30.08): планировщик встроен в server.js (`config.modelManager`, дефолт 6ч, ±10мин джиттер, первый цикл через 2мин; crontab-строка удалена). Модули: `lib/modeldb.js` (ModelDB + computeScore: successRate 0.4/латентность 0.3/окно 0.2/свежесть 0.1, models-db.json — атомарный tmp+rename), `lib/modelscan.js` (адаптеры источников; весь fetch injectable — тесты без сети; параллельный тест concurrency 5; **SOURCES без mistral/deepseek** — там платные модели), `lib/modelmanager.js` (single-flight цикл; seed каталога с флагом `seeded`; dead только при 404/402; перепроверка dead через `recheckDisabledDays`=7 → реактивация; user-disabled не трогается никогда; write-back priority ТОЛЬКО для не-seeded ключей; **isAutoAddable — автодобавляет только гарантированно-бесплатные**: `:free` или free-семейства по источнику, платные (mistral-medium/deepseek-v4-pro/GLM-5.2) отбрасываются). Ручные приоритеты в providers.json не перезаписываются. Экспозиция: `/v1/models-db` (auth), карточка «База моделей» в dashboard, CLI `tools/models-db.js`, `scripts/auto-manage-models.js` = тонкая обёртка над циклом.
-- **Анти-спираль 429** (30.08): target-first цепочка пропускает target-модель, если она `ratelimited` или дневной лимит ≥90% (`targetBurned`) — иначе каждый запрос жёг бесполезную 429-попытку и каскадом валил пул. Каталог ужат с 82 до 34 проверенных free-моделей (убраны mistral-*-дубли, hf-дубли, платные deepseek-v4-pro/mistral-medium/magistral, локальные ollama/lmstudio); models-db приведена к каталогу (stale-записи удалены).
-- **Крутящийся пул по дневным лимитам** (30.08): `usedTodayFor(key)` из `dailyUsage[..][today]`; провайдер, исчерпавший дневной лимит, исключается из выбора (`exemptables`), возвращается в `windowPool` только если живы все выгорели. Исчерпанные штрафуются ×0.03 (резерв), ≥90% — ×0.4. Исправлен баг: раньше штраф считался по всевременному `providerUsage` (всегда ~0.5, не отражал лимит) и при всех выгоревших пул не сужался. Live: с 18:30 ни одного 429, 8/8 стресс-запросов 200. Метрика `today` в `/v1/stats` (successRate по `reliability` за день).
-- **Дашборд** (lib/dashboard.js): редизайн 30.08 — sticky KPI-полоска + 5 табов (Обзор/Провайдеры/Модели/Контекст/Настройки). Zero-dep, инлайн CSS/JS, **двухязычный RU/EN** (словарь I18N, `setLang`, localStorage, автодетект). Провайдеры — таблица с поиском/фильтрами-чипсами/сортировкой/лимит-барами; Модели — таблица из /v1/models-db + **тумблер вкл/выкл + «Тест» из UI + блок «Что включить»** (рекомендации); Обзор — алерты + RPM-график + недавние + кэш/токены/очередь; Контекст — телеметрия + категории задач прогресс-барами; Настройки — setup-панель /v1/setup/* (двухязычные KEY_GROUPS: name/desc/steps + _en). Endpoints: `/v1/models/{key}/toggle` (flip enabled в config.json → hot-reload → статус untested/user-disabled), `/v1/models/{key}/test` (живой hi-тест → markChecked). Обновление 5с (модели 30с).
-- **Тир-маппинг**: tier-s→codestral, tier-splus/tier-l→minimax-m3, tier-xl→dots-3, Best→minimax-m3.
-- **404**: «does not exist» → permanent disable; «Provider returned error» → короткий circuit-breaker 70с, не отключает провайдера.
-- **Bandit-прогрев**: холодные приоры {1,1} или ≤4 испытаний → {a:6,b:2} при старте сервера.
+## Ключевые решения (текущие)
+- **Health через `/models`** (не реальный запрос) — не жечь дневные лимиты.
+- **Ретраи НЕ при 429/401/404**; кап latency 60с.
+- **target-first цепочка**: алиас идёт на мапп-провайдера первым; при `targetBurned` (429/лимит ≥90%) или `targetMismatch` (search/chat на coding-модель) — скип.
+- **Крутящийся пул по дневным лимитам**: выгоревшие исключаются (`exemptables`), штраф ×0.03/×0.4.
+- **Окно-роутинг** (`WINDOW_SAFETY=2.0`, `MIN_WINDOW=50k`): большие запросы только на провайдеров с достаточным окном; `needsWindowUpgrade()` — апгрейд при `est > win×1.5`.
+- **Анти-замирание**: провайдер с ошибками/день ≥15 исключается из пула (fallback если пул пуст).
+- **Кэш**: TTL 24ч + семантический (char-trigram dice 0.85) в `lib/cache.js`+`lib/semcache.js`. **tool-запросы обходят кэш** (не кэшируются как текст — иначе агент не получал инструменты).
+- **Очистка ответа** (`lib/clean.js`): stripThink, fixReasoningMessage (reasoning→content), isTooShort учитывает tool_calls.
+- **Компакция прокси ОТКЛЮЧЕНА** (`config.compacter.enabled=false`): её делает КЛИЕНТ (opencode auto-compaction). Константы `lib/compactor.js`: `CHARS_PER_TOKEN=3.5`, `COMPACT_THRESHOLD=60000`, `KEEP_RECENT_TOKENS=12000`, `MAX_COMPACT_THRESHOLD=200000`, `compactionThresholdFor = min(win*0.5, 200k)`. Логика окна/апгрейда остаётся в server.js.
+- **Умные слои**: `taskclassify` (coding/reasoning/search/chat/design), `methodology` (системный промпт-методолог), `websearch` (DuckDuckGo для search), `vetting` (самопроверка), `compress` (Caveman), `strategy` (weighted/roundrobin/least), `bandit` (обучение выбора).
+- **Телеметрия**: `lib/contextstats.js` (бакеты час|провайдер, категории задач, окна), `lib/health.js` (stats, errors, dailyUsage), `lib/diagmonitor.js` (снапшоты каждые 30м в diag_history.json), CLI `npx freegate diag`.
+- **Автообновление**: `config.autoUpdate.enabled` → git fetch + ff-pull + рестарт launchd (для git-установки, НЕ для Docker). `lib/autoupdate.js`.
+- **Автопоиск моделей**: `config.modelManager` (6ч) — `lib/modelmanager.js`+`modelscan.js`+`modeldb.js`. `isAutoAddable` — только гарантированно бесплатные.
+- **Дашборд** (`lib/dashboard.js`): RU/EN, KPI-полоска, табы Обзор/Провайдеры/Модели/Контекст/Диагностика/Настройки. Версия в сайдбаре. `scripts/set-model-version.js` прокидывает версию в имя модели opencode (`Freegate (Best · vX)`).
+
+## ГЛАВНАЯ ПРОБЛЕМА (текущая)
+**Агент «останавливается» на больших контекстах (138k).** Диагностировано: это НЕ прокси (отвечает 200, 3-5с, без ошибок). Причины:
+1. tool-выводы в opencode НЕ обрезаются (`tailscale tail -60`, огромные стеки, повторяющиеся `poll error 409`) → контекст раздувается мусором до 136-138k.
+2. free-модели на таком контексте деградируют: не вызывают tool_calls, уходят в думание (`content=0, tools=False, fin=length`). Проверено на dots-3/gemini/minimax — все одинаково.
+**Решение (клиентская сторона, не прокси):** обрезать длинные tool-выводы в opencode; короче сессии; или `paid-fallback` (платный ключ держит tool на больших контекстах).
 
 ## Известные проблемы
-- **НЕ компактится одиночное гигантское сообщение** (compactor.js `compactOld`, `old.length===0`): крупный user-промпт >30k токенов уходит целиком — `kodestral` (win 33k) получает 120k+ prompt_tokens. В телеметрии виден как `OVERFLOW` c `compactCount:0`. Фикс: суммировать одиночный промпт/режется хвост, а НЕ полный диалог.
-- ~~Window-aware роутинг обходит primary-target~~ **ИСПРАВЛЕНО 30.08**: `target-first` пропускается при `windowUpgraded`, target исключается, апгрейд идёт на capable-пул (см. окно-осознанный авто-апгрейд).
-- **Gemini** часто в квоте (429) — формат правильный, но лимит. Восстанавливается.
-- **Nemotron-120b/550b** отвечают думанием вслух — отключены в активном конфиге.
-- **Локальные модели (Ollama)** — на слабом Mac не использовать (9GB RAM).
-- ~~Mojibake в русском ответе~~ **ИСПРАВЛЕНО 26.08**: `data += chunk` / `chunk.toString()` дробили multi-byte UTF-8 на '' (символ `р` резался по байтам). Теперь везде `StringDecoder('utf8')` (providers.js + server.js, streams/cache/retry).
-- **Категория minimax-m3**: `or-minimax-m3-free` была `vision` (ложная классификация из старого автопоиска, 'multimodal' в описании OpenRouter) — исправлено на `general`. Иначе методолог/роутинг штрафовали основную рабочую лошадку tier-splus/tier-l/Best.
-- **Простая задача ≠ reasoning-модель** (30.08): при `taskCategory`=chat/search weighted-selection штрафует reasoning ×0.15 и vision ×0.3 — простой факт/поиск идёт на быстрые general, а не «думает вслух» на дорогих reasoning-моделях. E2E: «столица Франции» на tier-s → «Париж» за 0.46с.
-- **Поисковая категория** (30.08): SEARCH_PREFIX_RE (`что (такое/значит/означает)|расскажи|объясни|как|где|кто|найди`) ловится ДО reasoning — «что означает X» больше не уходит в «рассуждай пошагово». Расширены SEARCH_HINTS («как работает», «расскажи про»). Категория search теперь наполняется, а не всегда 0.
-- **Frontend Designer (design)** (31.08): категория `design` в taskclassify (DESIGN_HINTS/DESIGN_UI_RE/DESIGN_TECH_RE — лендинги, вёрстка, UI/UX, компоненты, Tailwind/CSS/React) + методолог-дизайнер в methodology.js (по мотивам Anthropic `frontend-design`, Apache-2.0). Роутинг: design→coding ×1.6, →reasoning ×0.4. Метрика `tasks.design` в contextstats + цвет в дашборде. Включено по умолчанию. Полный скилл для opencode: плагин `@sentiolabs/opencode-frontend-design` подключён в `~/.config/opencode/opencode.jsonc`.
-- **Качество/поиск** (31.08): `lib/websearch.js` — веб-поиск DuckDuckGo (без ключа) для search/chat-задач, чтобы модель не галлюцинировала («что такое минимакс дизайн» → реальные факты про MiniMax, а не «минимализм»). Парсер DDG HTML (decodeUrl для uddg-, parseDdg), injectable fetchImpl, при сбое → просто пропуск. В server.js: поиск до кэша, контекст вставляется system-сообщением. `config.websearch.{enabled,limit,timeout,queryMinChars}`. Роутинг: search→general (≥×1.2), coding-target пропускается для search/chat (targetMismatch) — codestral не отвечал на вопросы-поиски. Live: «минимекс компания» → «MiniMax (Xiyu Technology), Китай, Шанхай, мультимодальные LLM».
+- **10 падающих тестов contextstats** (`TypeError: reading 'compactCount'`) — `measure.compacted`/`measure.sentTokens` не передаются в тестах. Предсуществующее. Починить.
+- Одиночное гигантское сообщение не компактится (`old.length===0`).
+- Gemini часто 429; многие free-модели OpenRouter 404 (реально работает только dots-3 из больших окон).
+- `providers.json` runtime-пересортировка приоритетов автопоиском → не коммитить, `git checkout providers.json`.
+- `estimateTokens = chars/CHARS_PER_TOKEN` занижает для кода (повторяющиеся символы) — окно-эвристика хрупкая.
 
 ## Тесты
-- 255 тестов: `node --test test/*.test.js` (proxy, clean, compactor, memory, memory-store, vision, dashboard, semcache, contextstats, taskclassify, methodology, modeldb, modelscan, modelmanager)
-- Перед публикацией: тесты + `node --check server.js lib/*.js`
-- `POST /v1/cache/clear` и `POST /v1/reload` требуют auth (Bearer); память чистится/сейвится автоматически
-
-## Мультиагентность (opencode)
-Глобальные субагенты в `~/.config/opencode/agent/`:
-- **reviewer** — код-ревью (tier-splus = Ox Alpha, edit запрещён)
-- **researcher** — исследование кода (tier-s, edit запрещён)
-- **tester** — тесты и поиск багов (tier-s, edit разрешён)
-- **content** — генерация шортс/постов (tier-s, через tools/)
-
-Запускаются параллельно через Task tool — каждый в изолированном контексте.
-
-## Онбординг (Итерация 2, 30.08)
-- `freegate init -i` — два режима: **quick** (1 ключ OpenRouter → 15+ free-моделей) / **full** (все ключи → 8 источников). Объяснение разницы + подсказка «добавь остальные ключи в дашборде → Настройки».
-- `freegate init` (неинтерактивный) — копирует config.example.json + .env.example без перезаписи (как раньше).
-- Вывод wizard'а: «Подключить к Cursor: ... http://localhost:4000/v1» — стартовый сниппет.
-- README.ru/README: quick-start с режимами + «Cursor в 2 клика».
-
-## Виральность + экономия + чистка (30.08)
-- **Экономия ($)**: `lib/economics.js` (aggregateSavings: input $3/M, output $15/M репрезентативно), поле `savings` в `/v1/stats`, карточка «Экономия» в дашборде (Обзор, акцентная сумма). Live: $35.10 на 10.6M токенов.
-- **Бейджи README**: «One endpoint — all agents» (#00d4ff), «price $0» (#00ff88), «runs locally — private» (#00ff88). Секция «🔒 Работает локально» (localhost свой у каждого, ключи/переписки не уходят) + скриншоты нового дашборда (assets/dashboard.png, assets/dashboard-models.png, 1372×800). Число моделей обновлено 25→34.
-- **Чистка бренда**: label launchd `com.davilcod.proxy`→`com.freegate.proxy`; тестовый tmp `davil-init-`→`freegate-init-`; титл дашборда уже «Freegate». DAVIL Cod остался только в исторических логах (gitignored).
-- **Удалена дублирующая launchd-служба** `com.davilcod.model-manager` (каждые 6ч запускала scripts/auto-manage-models.js parallel со встроенным ModelManager → двойной спам проб → перерасход лимитов). Теперь только встроенный планировщик в server.js.
-
-## Доработка 31.08 (кэш/проверка/аналитика)
-- **Кэш**: TTL 1ч→24ч (повторы агентов/ретраи кэшируются на сутки, экономят free-лимиты). Механизм исправен: hits растут, cache.json persist пишется.
-- **Аналитика тиров**: сегодня нагрузка сбалансирована — mistral-codestral 80% (быстрая general), reasoning почти не юзается. `or-ox-alpha` 603 all-time — исторический артефакт старого маппинга (488 25.08), сегодня 0. Лимиты (minimax/dots-3) держатся на 2% — крутящийся пул оставляет запас.
-- **Счётчик ошибок** `today` сбрасывается по дню (reliability); утренние 429 до фикса накапливаются, после — не растут (проверено 8/8).
+- `node --test test/*.test.js` → **316 pass / 326** (10 fail contextstats).
+- Перед релизом: `node --check server.js lib/*.js` + тесты.
 
 ## Публикация
-- npm: `npm version patch && npm publish` (ключ в ~/.npmrc, bypass 2FA)
-- Docker: `docker build -t nik951751/freegate . && docker push`
-- GitHub: `git push` (CI сам гоняет тесты + Docker)
+- npm: `npm publish` (ключ в ~/.npmrc). Docker: `docker build -t nik951751/freegate:VERSION . && docker push`. GitHub: `git push` + `gh release create vX`. Версия в имя модели: `node scripts/set-model-version.js`.
+- Локальная установка: launchd `com.free-llm-proxy`, live-проверка `launchctl kickstart -k gui/$(id -u)/com.free-llm-proxy` + `curl /v1/stats`.
+- Рабочая папка: `/Users/sid/.config/opencode/llm-proxy`, ветка `main`, origin Artur21101965/freegate.
+
+## Карта проекта
+```
+server.js               — ядро: HTTP, роутинг, стрим, выбор провайдера, window-upgrade
+lib/
+  providers.js          — PROVIDERS (каталог в память), MODEL_MAP (тир→провайдер), callProvider, sanitizeBody
+  routing.js            — classifyComplexity, maybeUpgradeTier, needsWindowUpgrade
+  strategy.js           — weighted/roundrobin/least модификаторы веса
+  cache.js              — LRUCache (TTL 24ч, семантический через semcache/normalize)
+  semcache.js           — семантический кэш (char-trigram dice)
+  clean.js              — stripThink, fixReasoningMessage, isTooShort (учитывает tool_calls)
+  compactor.js          — компакция (ОТКЛЮЧЕНА по умолчанию), estimateTokens, compactionThresholdFor
+  health.js             — stats, health, errors, dailyUsage, bandit, context, recent
+  contextstats.js       — телеметрия бакетов час|провайдер, категории задач
+  modelmanager.js       — автопоиск моделей (6ч), isAutoAddable
+  modelscan.js          — адаптеры источников (SOURCES/SOURCE_META)
+  modeldb.js            — ModelDB (models-db.json), computeScore
+  taskclassify.js       — категория задачи (coding/reasoning/search/chat/design)
+  methodology.js        — системный промпт-методолог
+  websearch.js          — DuckDuckGo поиск для search-задач
+  vetting.js            — самопроверка ответа второй моделью
+  compress.js           — Caveman-сжатие промпта
+  bandit.js             — Thompson sampling выбор провайдера
+  setup.js              — KEY_GROUPS, validateKey, saveKeys
+  doctor.js / diag.js   — CLI-аналитика (snapshot, buildReport)
+  diagmonitor.js        — снапшоты метрик каждые 30м (diag_history.json)
+  autoupdate.js         — git update + рестарт (config.autoUpdate)
+  dashboard.js          — HTML-дашборд (RU/EN, табы, /v1/setup/*)
+bin/freegate.js         — CLI: start/diag/doctor/connect/init/dashboard/status
+tools/                  — Python-генераторы шортс (отдельно от роутинга)
+test/*.test.js          — 326 тестов; 316 pass, 10 fail (contextstats)
+```
+
+### Эндпоинты
+`/v1/chat/completions` (основной), `/v1/models` `/v1/models-db` `/v1/recent` `/v1/rpm` `/v1/stats` `/v1/config` `/v1/reload` `/v1/cache/clear` `/v1/setup/keys` `/v1/setup/validate` `/v1/shorts`.
+
+### CLI
+`start` `status` `diag` `doctor` `connect` `init` `dashboard` `test` `themes` `install-service` `version`.
