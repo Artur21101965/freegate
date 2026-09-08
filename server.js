@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { LRUCache } = require('./lib/cache');
 const { PROVIDERS, MODEL_MAP, callProvider, reloadProviders } = require('./lib/providers');
-const { loadState, initHealth, isCircuitOpen, recordSuccess, recordFailure, recordRequest, recordTokens, getHealth, getStats, getReliability, recordRecent, recordRpm, getRecent, getRpm, recordSelection, getLastSelection, getBandit, recordBandit, warmBanditPriors, getContextStats, getHourly } = require('./lib/health');
+const { loadState, initHealth, isCircuitOpen, recordSuccess, recordFailure, recordRequest, recordTokens, getHealth, getStats, getReliability, recordRecent, recordRpm, getRecent, getRpm, recordSelection, getLastSelection, getBandit, recordBandit, warmBanditPriors, getContextStats, getHourly, getCircuitBreakers } = require('./lib/health');
 const { checkRateLimit } = require('./lib/rateLimit');
 const {
   isAuthorized,
@@ -87,6 +87,27 @@ const MAX_CHAT_BODY = 2 * 1024 * 1024;
 // Малые JSON-эндпоинты (шортс, настройка ключей, конфиг): 100KB.
 const MAX_SMALL_BODY = 100 * 1024;
 const VERSION = (() => { try { return require('./package.json').version; } catch { return 'dev'; } })();
+
+// --- Процессные метрики (audit #26) ---
+// Лёгкие счётчики "с момента старта" для GET /v1/metrics. Не пишутся на диск,
+// бесплатны: инкремент на каждый запрос/терминальную точку.
+const metrics = {
+  startedAt: Date.now(),
+  requests: 0,
+  chatRequests: 0,
+  byStatus: {},
+  byProvider: {},
+};
+
+// Короткий reqId для correlation в логах и заголовке X-Request-Id.
+function newReqId() {
+  try { return require('crypto').randomBytes(5).toString('hex'); } catch { return String(Date.now().toString(36)); }
+}
+
+function addReqId(req, res) {
+  req.reqId = newReqId();
+  res.setHeader('X-Request-Id', req.reqId);
+}
 
 // --- Долговременная память (vector memory) ---
 // По умолчанию включена: факты берутся побочно от компакции (без лишних вызовов
@@ -344,6 +365,9 @@ async function handleChatCompletion(req, res, body) {
   const commit = (status) => {
     measure.status = status;
     contextStats.record(measure);
+    metrics.chatRequests++;
+    const pk = measure.provider;
+    if (pk) metrics.byProvider[pk] = (metrics.byProvider[pk] || 0) + 1;
   };
 
   // Vision detection: if the request contains images, route to a vision provider.
@@ -621,7 +645,7 @@ async function handleChatCompletion(req, res, body) {
   const hasTools = !!(body.tools || body.tool_choice);
   const cached = hasTools ? null : cache.get(effectiveModel, body.messages, body.temperature, body.tools || body.tool_choice);
   if (cached) {
-    logger.request({ model: requestedModel, provider: 'cache', status: 200, cached: true });
+    logger.request({ model: requestedModel, provider: 'cache', status: 200, cached: true, reqId: req.reqId });
     recordRecent({ model: requestedModel, provider: 'cache', status: 200, latency: 0, cached: true });
     measure.cacheType = 'exact';
     commit(200);
@@ -633,7 +657,7 @@ async function handleChatCompletion(req, res, body) {
   if (SEMCACHE_CONFIG.enabled && !hasTools) {
     const semantic = cache.getSemantic(effectiveModel, body.messages, body.temperature, SEMCACHE_CONFIG.minSimilarity);
     if (semantic) {
-      logger.request({ model: requestedModel, provider: 'semcache', status: 200, cached: true });
+      logger.request({ model: requestedModel, provider: 'semcache', status: 200, cached: true, reqId: req.reqId });
       recordRecent({ model: requestedModel, provider: 'semcache', status: 200, latency: 0, cached: true });
       measure.cacheType = 'semcache';
       commit(200);
@@ -935,7 +959,7 @@ async function handleChatCompletion(req, res, body) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
           recordSuccess(key);
           recordRequest(key, true);
-          logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming });
+          logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming, reqId: req.reqId });
           recordRecent({ model: requestedModel, provider: key, status: 200, latency: result.latency, cached: false });
           recordSelection(key, provider.model, requestedModel);
           const { Transform } = require('stream');
@@ -1039,7 +1063,7 @@ async function handleChatCompletion(req, res, body) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
         recordSuccess(key);
         recordRequest(key, true);
-        logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming });
+        logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming, reqId: req.reqId });
         recordRecent({ model: requestedModel, provider: key, status: 200, latency: result.latency, cached: false });
         recordSelection(key, provider.model, requestedModel);
         res.on('error', (err) => {
@@ -1099,7 +1123,7 @@ async function handleChatCompletion(req, res, body) {
         recordSuccess(key);
         recordRequest(key, true);
         recordBandit(complexityBucket, key, true);
-        logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming });
+        logger.request({ model: requestedModel, provider: key, status: 200, latency: result.latency, stream: isStreaming, reqId: req.reqId });
         recordRecent({ model: requestedModel, provider: key, status: 200, latency: result.latency, cached: false });
         recordSelection(key, provider.model, requestedModel);
         measure.provider = key;
@@ -1326,7 +1350,7 @@ function hitRateLimit(req, res, limit) {
   res.setHeader('RateLimit-Reset', String(Math.ceil(r.resetAt / 1000)));
   if (!r.allowed) {
     res.setHeader('Retry-After', String(r.retryAfter));
-    logger.warn('Rate limit exceeded', { ip: serviceKey, limit: r.limit });
+    logger.warn('Rate limit exceeded', { ip: serviceKey, limit: r.limit, reqId: req.reqId });
     sendJsonError(res, 429, 'Rate limit exceeded', { type: 'rate_limit_error', code: 'rate_limit_exceeded' });
     return false;
   }
@@ -1334,6 +1358,14 @@ function hitRateLimit(req, res, limit) {
 }
 
 const server = http.createServer(async (req, res) => {
+  addReqId(req, res);
+  metrics.requests++;
+  // Счётчик по статусу для некорм-запросов (setup/keys, models, stats…):
+  // статус становится известен только в момент завершения ответа.
+  res.on('finish', () => {
+    metrics.byStatus[res.statusCode] = (metrics.byStatus[res.statusCode] || 0) + 1;
+  });
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -1348,7 +1380,7 @@ const server = http.createServer(async (req, res) => {
   // Central auth: everything except /health requires AUTH_KEY when configured.
   // Accepts Authorization: Bearer (API clients) and ?key= (browser/admin routes).
   if (parsedUrl.pathname !== '/health' && AUTH_KEY && !isAuthorized(req, AUTH_KEY)) {
-    logger.debug('Auth rejected', { path: parsedUrl.pathname, ip: req.socket.remoteAddress });
+    logger.debug('Auth rejected', { path: parsedUrl.pathname, ip: req.socket.remoteAddress, reqId: req.reqId });
     sendJsonError(res, 401, 'Invalid API key', { code: 'invalid_api_key' });
     return;
   }
@@ -1515,6 +1547,45 @@ const server = http.createServer(async (req, res) => {
     const contextSummary = (() => { try { return contextStats.summary(); } catch { return null; } })();
     res.writeHead(upCount > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: upCount > 0 ? 'ok' : 'degraded', providers: { up: upCount, total: totalCount }, context: contextSummary }));
+    return;
+  }
+
+  // GET /v1/metrics — лёгкий monitoring (audit #26): процесс + счётчики
+  // "с момента старта" + обзор состояния. Не содержит персональных данных.
+  if (parsedUrl.pathname === '/v1/metrics') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
+    const mem = process.memoryUsage();
+    const circ = getCircuitBreakers();
+    const openCount = Object.values(circ).filter(c => c && c.openUntil > Date.now()).length;
+    const healthAll = getHealth();
+    const downCount = Object.values(healthAll).filter(h => h && h.status === 'down').length;
+    const rateLimitSrv = require('./lib/rateLimit');
+    const contextSummary = (() => { try { return contextStats.summary(); } catch { return null; } })();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      started_at: metrics.startedAt,
+      uptime_seconds: Math.floor((Date.now() - metrics.startedAt) / 1000),
+      pid: process.pid,
+      process: {
+        rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal,
+        external: mem.external,
+        cpu: process.cpuUsage ? process.cpuUsage() : null,
+        platform: process.platform, node: process.version,
+      },
+      counters: {
+        requests: metrics.requests,
+        chat_requests: metrics.chatRequests,
+        by_status: Object.fromEntries(Object.entries(metrics.byStatus).sort((a, b) => Number(a[0]) - Number(b[0]))),
+        by_provider: Object.fromEntries(Object.entries(metrics.byProvider).sort((a, b) => b[1] - a[1])),
+      },
+      state: {
+        circuit_breakers: { open: openCount, total: Object.keys(circ).length },
+        down: downCount,
+        rate_limit_clients: rateLimitSrv.getStats ? Object.keys(rateLimitSrv.getStats()).length : 0,
+        cache: cache.stats(),
+        context: contextSummary,
+      },
+    }));
     return;
   }
 
