@@ -1,8 +1,14 @@
 // test/cache.test.js
-const { describe, it } = require('node:test');
+const { describe, it, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+// Isolate cache persistence into a temp file.
+process.env.CACHE_PATH = process.env.CACHE_PATH || path.join(os.tmpdir(), 'freegate-cache-test.json');
+const CACHE_PATH_TMP = process.env.CACHE_PATH;
+
 const { LRUCache } = require('../lib/cache');
 
 function freshCache() {
@@ -91,19 +97,18 @@ describe('LRUCache.getSemantic', () => {
 });
 
 describe('LRUCache grams persistence', () => {
-  it('persists grams/model/temperature and restores them on load', () => {
-    // Write through the module's own CACHE_PATH (same pattern as proxy.test.js).
+  it('persists grams/model/temperature and restores them on load', async () => {
+    // Write through the module's CACHE_PATH (isolated to a temp file).
     const c = new LRUCache(20, 60000, true, true);
     c.set('persist-model', [{ role: 'user', content: 'напиши резюме проекта полностью' }], 0.7, { ok: true });
-    c.persist();
+    await c.persist();
 
-    const data = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cache.json'), 'utf8'));
+    const data = JSON.parse(fs.readFileSync(CACHE_PATH_TMP, 'utf8'));
     const entry = (data.entries || []).find(e => e.model === 'persist-model');
     assert.ok(entry, 'entry persisted with model');
     assert.equal(entry.temperature, 0.7);
     assert.ok(Array.isArray(entry.grams) && entry.grams.length > 0, 'grams persisted');
-
-    try { fs.unlinkSync(path.join(__dirname, '..', 'cache.json')); } catch {}
+    try { fs.unlinkSync(CACHE_PATH_TMP); } catch {}
   });
 });
 
@@ -136,3 +141,45 @@ describe('LRUCache provider tag', () => {
 // The auto-persist interval keeps the event loop alive; stop it so the
 // process can exit (same pattern as proxy.test.js).
 require('../lib/cache')._stopTimers();
+
+describe('LRUCache.persist (atomic async)', () => {
+  it('writes entries to disk via temp file + rename, no .tmp left', async () => {
+    const c = freshCache();
+    c.set('m', [{ role: 'user', content: 'привет мир как дела' }], 0, { a: 1 });
+    await c.persist();
+    assert.ok(fs.existsSync(CACHE_PATH_TMP), 'persisted file exists');
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH_TMP, 'utf8'));
+    assert.equal(raw.entries.length, 1, 'one entry on disk');
+    assert.ok(!fs.existsSync(CACHE_PATH_TMP + '.tmp'), 'no tmp file after persist');
+    // A fresh (non-skipLoad) cache restores it
+    const c2 = new LRUCache(20, 60000, false, true);
+    const hit = c2.get('m', [{ role: 'user', content: 'привет мир как дела' }], 0);
+    assert.deepEqual(hit, { a: 1 }, 'entry restored from disk');
+    c2.clear();
+  });
+
+  it('does not persist entries larger than MAX_ENTRY_BYTES', async () => {
+    const c = freshCache();
+    c.set('big', [{ role: 'user', content: 'x' }], 0, { blob: 'y'.repeat(300 * 1024) });
+    await c.persist();
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH_TMP, 'utf8'));
+    assert.strictEqual(raw.entries.filter(e => e.key !== undefined && e.value).length, 0, 'oversized entry skipped');
+    assert.ok(!fs.existsSync(CACHE_PATH_TMP + '.tmp'));
+  });
+
+  it('persistSync flushes synchronously (shutdown path)', () => {
+    const c = freshCache();
+    c.set('ms', [{ role: 'user', content: 'синхронный флаш тест' }], 0, { ok: true });
+    const ok = c.persistSync();
+    assert.strictEqual(ok, true);
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH_TMP, 'utf8'));
+    assert.equal(raw.entries.length, 1);
+    assert.ok(!fs.existsSync(CACHE_PATH_TMP + '.tmp'));
+  });
+});
+
+// Cleanup temp file after tests.
+after(() => {
+  try { fs.unlinkSync(CACHE_PATH_TMP); } catch {}
+  try { fs.unlinkSync(CACHE_PATH_TMP + '.tmp'); } catch {}
+});

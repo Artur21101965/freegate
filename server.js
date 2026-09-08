@@ -6,6 +6,13 @@ const { LRUCache } = require('./lib/cache');
 const { PROVIDERS, MODEL_MAP, callProvider, reloadProviders } = require('./lib/providers');
 const { loadState, initHealth, isCircuitOpen, recordSuccess, recordFailure, recordRequest, recordTokens, getHealth, getStats, getReliability, recordRecent, recordRpm, getRecent, getRpm, recordSelection, getLastSelection, getBandit, recordBandit, warmBanditPriors, getContextStats, getHourly } = require('./lib/health');
 const { checkRateLimit } = require('./lib/rateLimit');
+const {
+  isAuthorized,
+  readJsonBody,
+  validateChatRequest,
+  validateShortsRequest,
+  maskKey,
+} = require('./lib/security');
 const { handleDashboard } = require('./lib/dashboard');
 const { acquire, stats: poolStats } = require('./lib/pool');
 const { aggregateSavings } = require('./lib/economics');
@@ -20,6 +27,7 @@ const { prepareMessages, estimateTokens, setMemory: compactorSetMemory } = requi
 const { classify: classifyTask } = require('./lib/taskclassify');
 const { injectMethodology, enabledByDefault: methodEnabledByDefault } = require('./lib/methodology');
 const { create: createMemoryStore } = require('./lib/memory-store');
+const { trimToolOutputs, DEFAULT_OPTS: TOOLTRIM_DEFAULTS } = require('./lib/tooltrim');
 
 // Load persisted state
 loadState();
@@ -70,6 +78,14 @@ function getArg(name, defaultVal) {
 const PORT = parseInt(process.env.PORT || getArg('port', config.port || '4000'));
 const AUTH_KEY = process.env.AUTH || getArg('auth', config.auth || '');
 const RATE_LIMIT = config.rateLimit || { maxRequests: 100, windowMs: 60000 };
+// Генерация шортс — дорогая операция (внешний GPU): пекулярно строгий лимит.
+const SHORTS_RATE_LIMIT = { maxRequests: 3, windowMs: 10 * 60 * 1000 };
+// Админ-мутации (релоад, тоггл, сброс кэша, смена ключей) — пекулярно строгий лимит.
+const ADMIN_RATE_LIMIT = { maxRequests: 20, windowMs: 60000 };
+// Тело запроса chat: 2MB — больше нечего слать разумному чат-прокси.
+const MAX_CHAT_BODY = 2 * 1024 * 1024;
+// Малые JSON-эндпоинты (шортс, настройка ключей, конфиг): 100KB.
+const MAX_SMALL_BODY = 100 * 1024;
 const VERSION = (() => { try { return require('./package.json').version; } catch { return 'dev'; } })();
 
 // --- Долговременная память (vector memory) ---
@@ -107,6 +123,12 @@ const { shouldVet, vetAnswer, VETTING_DEFAULTS } = require('./lib/vetting');
 const VETTING_CONFIG = Object.assign(
   { ...VETTING_DEFAULTS },
   (config.vetting && typeof config.vetting === 'object') ? config.vetting : {}
+);
+
+// Обрезка гигантских tool-выводов (всегда on по умолчанию). config.tooltrim.enabled=false отключает.
+const TOOLTRIM_CONFIG = Object.assign(
+  { ...TOOLTRIM_DEFAULTS },
+  (config.tooltrim && typeof config.tooltrim === 'object') ? config.tooltrim : {}
 );
 
 // --- Стратегия роутинга ---
@@ -365,6 +387,9 @@ async function handleChatCompletion(req, res, body) {
       // first one that extracts text. Previously each was tried IN SEQUENCE,
       // so a slow/failed first provider meant the pipeline waited provider
       // after provider — the "two chats think forever" pattern for screenshots.
+      // Winner keeps its request; losers are aborted below (cheap cancellation,
+      // no wasted GPU calls), and their AbortErrors are never treated as failures.
+      const visionController = new AbortController();
       const visionAttempts = visionChain.map((visionProvider) => (async () => {
         const visionBody = {
           model: visionProvider.model,
@@ -381,7 +406,7 @@ async function handleChatCompletion(req, res, body) {
           }],
           max_tokens: 2000,
         };
-        const visionRes = await callProvider(visionProvider, visionBody);
+        const visionRes = await callProvider(visionProvider, visionBody, 30000, 1, visionController.signal);
         const text = visionRes.data?.choices?.[0]?.message?.content || visionRes.data?.choices?.[0]?.message?.reasoning || '';
         if (text) {
           logger.info('Vision pipeline: распознал ' + visionProvider.key);
@@ -396,6 +421,10 @@ async function handleChatCompletion(req, res, body) {
         extracted = await Promise.any(visionAttempts);
       } catch {
         logger.warn('Vision pipeline: все вижн-провайдеры не сработали', { tried: visionChain.map(p => p.key) });
+      } finally {
+        // Отменить проигравшие vision-запросы: их результат больше не нужен.
+        logger.debug('Vision pipeline: отменяю проигравших', { tried: visionChain.length });
+        visionController.abort();
       }
       const cleaned = stripThink(extracted, true);
       logger.info('Vision pipeline: скриншот распознан', { chars: cleaned.length });
@@ -424,16 +453,34 @@ async function handleChatCompletion(req, res, body) {
     }
   }
 
+  // Telemetry: measure original tokens BEFORE trimming/compaction.
+  if (Array.isArray(body.messages)) measure.origTokens = estimateTokens(body.messages);
+
+  // --- Tool output trimming ---
+  // Огромные tool-выводы (логи/стеки) раздувают контекст → free-модели деградируют
+  // и перестают вызывать tools. Обрезаем старые tool-выводы до stubов (head+tail),
+  // последние keepRecent оставляем почти целыми (модель работает с ними сейчас).
+  // Не компакция (не суммаризация, не удаление сообщений) — целевая обрезка гигантских
+  // выводов, которые opencode не обрезает. Кэш считается от обрезанных (стабильно).
+  if (TOOLTRIM_CONFIG.enabled && Array.isArray(body.messages)) {
+    const { messages: trimmed, trimmedCount, charsSaved } = trimToolOutputs(body.messages, TOOLTRIM_CONFIG);
+    if (trimmedCount > 0) {
+      body.messages = trimmed;
+      measure.toolTrim = { msgs: trimmedCount, chars: charsSaved };
+      logger.info('ToolTrim', { msgs: trimmedCount, chars: charsSaved, est: estimateTokens(trimmed) });
+    }
+  }
+
   // Window-aware upgrade: если запрос не влезает в окно целевой модели (после
-  // vision-апгрейда target), компакция НЕ запускается — суммаризатор не должен
+  // vision-апгрейда + trim), компакция НЕ запускается — суммаризатор не должен
   // сжимать контекст, который провайдер с большим окном возьмёт целиком.
+  // Считается от обрезанных сообщений (реальный размер, который уйдёт провайдеру).
   const windowUpgraded = Array.isArray(body.messages) && body.messages.length > 0 &&
     needsWindowUpgrade(PROVIDERS[targetProviderKey]?.context_window || 0, estimateTokens(body.messages));
 
   // Compact overly large conversations so free models don't reject on context.
-  // Runs AFTER the vision pipeline (images already converted to text above).
+  // Runs AFTER the vision pipeline + trim (images already converted, giant tool outputs stubbed).
   // Skipped in window-upgrade mode — the big provider takes the raw context.
-  if (Array.isArray(body.messages)) measure.origTokens = estimateTokens(body.messages);
   // Прокси-компакция ОПЦИОНАЛЬНА (config.compacter.enabled, по умолчанию false).
   // Компактит сам клиент (opencode auto-compaction / BigPickle) — он знает
   // смысловую структуру диалога и сохраняет «что осталось сделать». Прокси лишь
@@ -1264,42 +1311,60 @@ if (isTooShort(result.data, lastUserText(body.messages))) {
 }
 
 // Server
+
+function sendJsonError(res, statusCode, message, extra) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { message, ...(extra || {}) } }));
+}
+
+// Apply a per-IP rate limit, set standard headers, and stop the request on 429.
+function hitRateLimit(req, res, limit) {
+  const serviceKey = req.socket.remoteAddress || 'unknown';
+  const r = checkRateLimit(serviceKey, limit.maxRequests, limit.windowMs);
+  res.setHeader('RateLimit-Limit', String(r.limit));
+  res.setHeader('RateLimit-Remaining', String(r.remaining));
+  res.setHeader('RateLimit-Reset', String(Math.ceil(r.resetAt / 1000)));
+  if (!r.allowed) {
+    res.setHeader('Retry-After', String(r.retryAfter));
+    logger.warn('Rate limit exceeded', { ip: serviceKey, limit: r.limit });
+    sendJsonError(res, 429, 'Rate limit exceeded', { type: 'rate_limit_error', code: 'rate_limit_exceeded' });
+    return false;
+  }
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // Baseline security headers on every response.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const parsedUrl = new URL(req.url, 'http://localhost:' + PORT);
 
+  // Central auth: everything except /health requires AUTH_KEY when configured.
+  // Accepts Authorization: Bearer (API clients) and ?key= (browser/admin routes).
+  if (parsedUrl.pathname !== '/health' && AUTH_KEY && !isAuthorized(req, AUTH_KEY)) {
+    logger.debug('Auth rejected', { path: parsedUrl.pathname, ip: req.socket.remoteAddress });
+    sendJsonError(res, 401, 'Invalid API key', { code: 'invalid_api_key' });
+    return;
+  }
+
   if (parsedUrl.pathname === '/') {
-    // Protect the dashboard with auth if one is configured.
-    // Browser-friendly: accept ?key= or Authorization header.
-    if (AUTH_KEY) {
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      const keyFromHeader = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      if (keyFromQuery !== AUTH_KEY && keyFromHeader !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key', code: 'invalid_api_key' } }));
-        return;
-      }
-    }
+    // Dashboard HTML/CSS/JS полностью инлайн (нет внешних ресурсов) — можно
+    // поставить strict CSP: только same-origin fetch + inline-скрипты/styles.
+    res.setHeader('Content-Security-Policy', "default-src 'none'; connect-src 'self'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'");
+    res.setHeader('X-Frame-Options', 'DENY');
     handleDashboard(req, res);
     return;
   }
 
   if (parsedUrl.pathname === '/v1/reload' && req.method === 'POST') {
     // Hot-reload providers.json + config.json without restarting the server.
-    // Auth-protected like the other admin endpoints.
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, ADMIN_RATE_LIMIT)) return;
     try {
       const result = reloadProviders();
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1313,15 +1378,6 @@ const server = http.createServer(async (req, res) => {
 
   if (parsedUrl.pathname === '/v1/config') {
     // Чтение/запись опций оптимизации (compress/vetting/routing) в config.json.
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
     try {
       const userCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
       if (req.method === 'GET') {
@@ -1334,22 +1390,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (req.method === 'POST') {
-        let body = '';
-        req.on('data', (c) => { body += c; if (body.length > 100000) req.destroy(); });
-        req.on('end', () => {
-          try {
-            const patch = JSON.parse(body || '{}');
-            if (typeof patch.compress === 'object') userCfg.compress = Object.assign({ enabled: false, minLen: 60 }, userCfg.compress, patch.compress);
-            if (typeof patch.vetting === 'object') userCfg.vetting = Object.assign({ enabled: false, minAnswerLen: 120, complexityOnly: true }, userCfg.vetting, patch.vetting);
-            if (typeof patch.routing === 'object') userCfg.routing = Object.assign({ strategy: 'weighted', preference: 'free-first' }, userCfg.routing, patch.routing);
-            fs.writeFileSync(CONFIG_PATH, JSON.stringify(userCfg, null, 2));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-          } catch (e) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Invalid config body: ' + e.message } }));
-          }
-        });
+        if (!hitRateLimit(req, res, ADMIN_RATE_LIMIT)) return;
+        const body = await readJsonBody(req, MAX_SMALL_BODY);
+        if (!body.ok) {
+          sendJsonError(res, body.code === 'EMPTY_BODY' || body.code === 'INVALID_JSON' ? 400 : 413, 'Invalid config body: ' + body.message);
+          return;
+        }
+        const patch = body.value;
+        if (typeof patch.compress === 'object') userCfg.compress = Object.assign({ enabled: false, minLen: 60 }, userCfg.compress, patch.compress);
+        if (typeof patch.vetting === 'object') userCfg.vetting = Object.assign({ enabled: false, minAnswerLen: 120, complexityOnly: true }, userCfg.vetting, patch.vetting);
+        if (typeof patch.routing === 'object') userCfg.routing = Object.assign({ strategy: 'weighted', preference: 'free-first' }, userCfg.routing, patch.routing);
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(userCfg, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
         return;
       }
       res.writeHead(405, { 'Content-Type': 'application/json' });
@@ -1364,15 +1417,7 @@ const server = http.createServer(async (req, res) => {
 
   if (parsedUrl.pathname === '/v1/models-db' && req.method === 'GET') {
     // Структурированная база моделей: паспорта + статистика + топ по скору.
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     try {
       const models = modelManager.db.all()
         .map(m => ({
@@ -1399,15 +1444,7 @@ const server = http.createServer(async (req, res) => {
   // Парсим /v1/models/{key}/toggle и /v1/models/{key}/test
   const modelActionMatch = parsedUrl.pathname.match(/^\/v1\/models\/([^/]+)\/(toggle|test)$/);
   if (modelActionMatch && req.method === 'POST') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, action === 'toggle' ? ADMIN_RATE_LIMIT : RATE_LIMIT)) return;
     const modelKey = decodeURIComponent(modelActionMatch[1]);
     const action = modelActionMatch[2];
 
@@ -1482,6 +1519,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/v1/stats') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     const s = getStats();
     const today = new Date().toISOString().slice(0, 10);
     const limits = {};
@@ -1529,6 +1567,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/v1/models') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     const models = Object.entries(PROVIDERS)
       .filter(([_, p]) => p.enabled)
       .map(([key, p]) => ({
@@ -1545,60 +1584,43 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/v1/chat/completions' && req.method === 'POST') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      if (apiKey !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
 
-    const serviceKey = req.socket.remoteAddress;
-    if (!checkRateLimit(serviceKey, RATE_LIMIT.maxRequests, RATE_LIMIT.windowMs)) {
-      res.writeHead(429, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'Rate limit exceeded' } }));
+    const bodyResult = await readJsonBody(req, MAX_CHAT_BODY);
+    if (!bodyResult.ok) {
+      if (bodyResult.code === 'PAYLOAD_TOO_LARGE') {
+        sendJsonError(res, 413, 'Request body too large', { type: 'invalid_request_error', code: 'payload_too_large' });
+        req.destroy();
+      } else {
+        sendJsonError(res, 400, bodyResult.message, { type: 'invalid_request_error', code: 'invalid_json_body' });
+      }
       return;
     }
+    const requestBody = bodyResult.value;
 
-    let body = '';
-    const MAX_BODY = 2 * 1024 * 1024; // 2MB cap
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > MAX_BODY) {
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Request body too large' } }));
-        req.destroy();
-      }
-    });
-    req.on('error', () => {});
-    req.on('end', async () => {
-      try {
-        const requestBody = JSON.parse(body);
-        // Validate minimal structure — reject junk before it burns provider limits
-        if (!requestBody || typeof requestBody !== 'object' ||
-            !Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'messages is required and must be a non-empty array', type: 'invalid_request_error', code: 'invalid_messages' } }));
-          return;
-        }
-        await handleChatCompletion(req, res, requestBody);
-      } catch (err) {
-        logger.error('Chat handler error', { message: err.message, stack: err.stack });
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid request body' } }));
-      }
-    });
+    // Validate structure + safety bounds before it burns provider limits.
+    const validationErrors = validateChatRequest(requestBody);
+    if (validationErrors.length > 0) {
+      sendJsonError(res, 400, 'Validation failed', {
+        type: 'invalid_request_error',
+        code: 'invalid_messages',
+        details: validationErrors,
+      });
+      return;
+    }
+    await handleChatCompletion(req, res, requestBody);
     return;
   }
 
   if (parsedUrl.pathname === '/v1/recent') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ data: getRecent() }));
     return;
   }
 
   if (parsedUrl.pathname === '/v1/rpm') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ data: getRpm() }));
     return;
@@ -1607,15 +1629,7 @@ const server = http.createServer(async (req, res) => {
   // POST /v1/cache/clear — drop the in-memory semantic cache without a restart.
   // Handy when you tweaked providers/models and don't want stale answers served.
   if (parsedUrl.pathname === '/v1/cache/clear' && req.method === 'POST') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, ADMIN_RATE_LIMIT)) return;
     const before = cache.stats().size || 0;
     cache.clear();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1626,67 +1640,61 @@ const server = http.createServer(async (req, res) => {
   // POST /v1/shorts — generate a vertical short video via the tools generator.
   // Body: { prompt, duration?, format? ("9:16"/"16:9"/"1:1"), steps? }
   if (parsedUrl.pathname === '/v1/shorts' && req.method === 'POST') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      if (apiKey !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
+    if (!hitRateLimit(req, res, SHORTS_RATE_LIMIT)) return;
+    const bodyResult = await readJsonBody(req, MAX_SMALL_BODY);
+    if (!bodyResult.ok) {
+      if (bodyResult.code === 'PAYLOAD_TOO_LARGE') {
+        sendJsonError(res, 413, 'Request body too large', { code: 'payload_too_large' });
+        req.destroy();
+      } else {
+        sendJsonError(res, 400, bodyResult.message, { code: 'invalid_json_body' });
+      }
+      return;
+    }
+    const params = bodyResult.value;
+    const validationErrors = validateShortsRequest(params);
+    if (validationErrors.length > 0) {
+      sendJsonError(res, 400, 'Validation failed', { code: 'invalid_short_request', details: validationErrors });
+      return;
+    }
+    const { execFile } = require('child_process');
+    const toolsDir = path.join(__dirname, 'tools');
+    const py = path.join(toolsDir, '.venv', 'bin', 'python');
+    const script = path.join(toolsDir, 'generate_shorts.py');
+    // Build argv exclusively from validated values (never put raw params in cmd).
+    const args = [script, params.prompt];
+    if (params.duration) args.push('--duration', String(params.duration));
+    if (params.format) args.push('--format', params.format);
+    if (params.steps) args.push('--steps', String(params.steps));
+    logger.info('Shorts generation requested', { prompt: params.prompt.slice(0, 60) });
+    execFile(py, args, { cwd: toolsDir, timeout: 600000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        logger.error('Shorts generation failed', { error: err.message, stderr: String(stderr).slice(0, 300) });
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Generation failed: ' + err.message, detail: String(stderr).slice(0, 300) } }));
         return;
       }
-    }
-    let body = '';
-    req.on('data', (c) => body += c);
-    req.on('end', async () => {
-      try {
-        const params = JSON.parse(body);
-        if (!params.prompt) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'prompt is required' } }));
-          return;
-        }
-        const { execFile } = require('child_process');
-        const toolsDir = path.join(__dirname, 'tools');
-        const py = path.join(toolsDir, '.venv', 'bin', 'python');
-        const script = path.join(toolsDir, 'generate_shorts.py');
-        const args = [script, params.prompt];
-        if (params.duration) args.push('--duration', String(params.duration));
-        if (params.format) args.push('--format', params.format);
-        if (params.steps) args.push('--steps', String(params.steps));
-        logger.info('Shorts generation requested', { prompt: params.prompt.slice(0, 60) });
-        execFile(py, args, { cwd: toolsDir, timeout: 600000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-          if (err) {
-            logger.error('Shorts generation failed', { error: err.message, stderr: String(stderr).slice(0, 300) });
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Generation failed: ' + err.message, detail: String(stderr).slice(0, 300) } }));
-            return;
-          }
-          // Parse absolute .mp4 paths from stdout
-          const files = String(stdout).split('\n')
-            .map(l => l.trim())
-            .filter(l => l.includes('.mp4') && l.startsWith('/'))
-            .map(l => l.split(' ').pop().trim());
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, files, stdout: String(stdout).slice(0, 2000) }));
-        });
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid request: ' + e.message } }));
-      }
+      // Parse absolute .mp4 paths from stdout
+      const files = String(stdout).split('\n')
+        .map(l => l.trim())
+        .filter(l => l.includes('.mp4') && l.startsWith('/'))
+        .map(l => l.split(' ').pop().trim());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, files, stdout: String(stdout).slice(0, 2000) }));
     });
     return;
   }
 
   // --- Setup Dashboard API ---
   if (parsedUrl.pathname === '/v1/setup/keys' && req.method === 'GET') {
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     const { keys } = readKeys();
     // Mask keys for display; inputs stay EMPTY so we never send masked values back.
     const masked = {};
     const empty = {};
     for (const [k, v] of Object.entries(keys)) {
       empty[k] = '';
-      if (!v) { masked[k] = ''; continue; }
-      if (v.length <= 10) { masked[k] = v.slice(0, 2) + '***' + v.slice(-2); continue; }
-      masked[k] = v.slice(0, 4) + '***' + v.slice(-4);
+      masked[k] = maskKey(v);
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ groups: KEY_GROUPS, keys: empty, masked }));
@@ -1694,46 +1702,31 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/v1/setup/keys' && req.method === 'POST') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
+    if (!hitRateLimit(req, res, ADMIN_RATE_LIMIT)) return;
+    const bodyResult = await readJsonBody(req, MAX_SMALL_BODY);
+    if (!bodyResult.ok) {
+      if (bodyResult.code === 'PAYLOAD_TOO_LARGE') {
+        sendJsonError(res, 413, 'Request body too large', { code: 'payload_too_large' });
+        req.destroy();
+      } else {
+        sendJsonError(res, 400, bodyResult.message, { code: 'invalid_json_body' });
       }
+      return;
     }
-    let body = '';
-    req.on('data', (c) => body += c);
-    req.on('end', () => {
-      try {
-        const newKeys = JSON.parse(body);
-        // Only accept known env vars
-        const filtered = {};
-        for (const k of Object.keys(KEY_GROUPS)) {
-          if (typeof newKeys[k] === 'string') filtered[k] = newKeys[k];
-        }
-        const result = saveKeys(filtered);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, ...result }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid request: ' + e.message } }));
-      }
-    });
+    const newKeys = bodyResult.value;
+    // Only accept known env vars
+    const filtered = {};
+    for (const k of Object.keys(KEY_GROUPS)) {
+      if (typeof newKeys[k] === 'string') filtered[k] = newKeys[k];
+    }
+    const result = saveKeys(filtered);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ...result }));
     return;
   }
 
   if (parsedUrl.pathname === '/v1/setup/validate') {
-    if (AUTH_KEY) {
-      const apiKey = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      const keyFromQuery = parsedUrl.searchParams.get('key');
-      if (apiKey !== AUTH_KEY && keyFromQuery !== AUTH_KEY) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
-        return;
-      }
-    }
+    if (!hitRateLimit(req, res, RATE_LIMIT)) return;
     const envVar = parsedUrl.searchParams.get('envVar');
     let testKey = parsedUrl.searchParams.get('apiKey');
     if (!envVar) {
@@ -1784,8 +1777,8 @@ server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
 const _shutdown = () => {
   if (memStore) { memStore.stopTimer(); memStore.save(); }
   diagMonitor.stopMonitor();
-  require('./lib/health').saveState();
-  cache.persist();
+  require('./lib/health').saveStateSync();
+  cache.persistSync();
   try { modelManager.stop(); } catch {}
   server.close(() => process.exit(0));
 };

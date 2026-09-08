@@ -91,9 +91,9 @@ test('rateLimit: allows under limit, blocks over', () => {
   // reset internal state by using a unique key
   const key = `test-${Date.now()}`;
   for (let i = 0; i < 5; i++) {
-    assert.strictEqual(checkRateLimit(key, 5, 60000), true);
+    assert.strictEqual(checkRateLimit(key, 5, 60000).allowed, true);
   }
-  assert.strictEqual(checkRateLimit(key, 5, 60000), false);
+  assert.strictEqual(checkRateLimit(key, 5, 60000).allowed, false);
 });
 
 test('health: classifyErrorMs returns sane durations', () => {
@@ -112,7 +112,7 @@ test('health/logger: уважают LOG_PATH/STATE_PATH (изоляция от �
   const health = require('../lib/health');
   const key = `iso-${Date.now()}`;
   health.recordFailure(key, 401);   // открывает breaker → logger.warn → пишет в LOG_PATH
-  health.saveState();               // пишет state в STATE_PATH
+  health.saveStateSync();           // пишет state в STATE_PATH (синхронно, детерминированно)
   const log = fs.readFileSync(process.env.LOG_PATH, 'utf8');
   assert.ok(log.includes(key), 'лог ушёл в изолированный LOG_PATH');
   const st = JSON.parse(fs.readFileSync(process.env.STATE_PATH, 'utf8'));
@@ -153,12 +153,17 @@ test('providers: catalog has vision-capable providers for screenshots', () => {
   assert.ok(names.includes('gemini-vision'), 'gemini-vision present');
 });
 
-test('health: 404 opens circuit breaker long (model unavailable for account)', () => {
+test('health: 404 trips breaker but short (health-probe backoff, not 5min)', () => {
   const health = require('../lib/health');
   const key = `cb404-${Date.now()}`;
-  // A single 404 should trip the breaker immediately (openMs 300s)
+  // Одиночный 404 после 3 фейлов даёт короткий trip (~60s), консекутивные
+  // растут экспоненциально до cap 5 мин — см. test/health.test.js.
   health.recordFailure(key, 404);
-  assert.strictEqual(health.isCircuitOpen(key), true);
+  assert.strictEqual(health.isCircuitOpen(key), false, 'single 404 не открывает сразу');
+  health.recordFailure(key, 404);
+  health.recordFailure(key, 404);
+  assert.strictEqual(health.isCircuitOpen(key), true, '3 фейла открывают breaker');
+  assert.ok(health.getCircuitBreakers()[key].openUntil - Date.now() < 300000, 'trip < 5min');
 });
 
 test('health: warming cold bandit priors boosts brand-new providers', () => {
@@ -312,7 +317,7 @@ test('health: saveState writes stats.context as buckets array (state restored)',
   const health = require('../lib/health');
   const statePath = process.env.STATE_PATH;
   health.getContextStats().record({ ts: Date.now(), provider: 'roundtrip-ctx', real: 1000, win: 2000, status: 200 });
-  health.saveState();
+  health.saveStateSync();
   const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
   assert.ok(saved.stats && Array.isArray(saved.stats.context.buckets), 'stats.context persisted as buckets array');
   health.getContextStats().load(saved.stats.context);

@@ -1,19 +1,29 @@
 // test/contextstats.test.js
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { ContextStats } = require('../lib/contextstats');
+const { ContextStats, isoHourOf } = require('../lib/contextstats');
 
 function fresh() { return new ContextStats(); }
+// Фиксированные абсолютные даты в тестах устаревали: бакеты старше 7-дневной
+// ретенции вычищались в snapshot()/serialize(). Используем относительные
+// таймстемпы внутри окна ретенции.
+function tHoursAgo(h, minute = 0) {
+  const d = new Date(Date.now() - h * 3600 * 1000);
+  d.setSeconds(0, 0);
+  d.setMinutes(minute, 0);
+  return d.getTime();
+}
 
 describe('ContextStats.record', () => {
   it('records a measure into hour|provider bucket', () => {
     const cs = fresh();
-    cs.record({ ts: Date.parse('2026-08-29T20:33:00Z'), provider: 'mistral-codestral', est: 5000, real: 10000, win: 33000, status: 200 });
+    const ts = tHoursAgo(2, 33);
+    cs.record({ ts, provider: 'mistral-codestral', est: 5000, real: 10000, win: 33000, status: 200 });
     const snap = cs.snapshot();
     assert.equal(snap.buckets.length, 1);
     const b = snap.buckets[0];
     assert.equal(b.provider, 'mistral-codestral');
-    assert.equal(b.hour, '2026-08-29T20:00');
+    assert.equal(b.hour, isoHourOf(ts));
     assert.equal(b.requests, 1);
     assert.equal(b.sumEst, 5000);
     assert.equal(b.sumReal, 10000);
@@ -33,7 +43,7 @@ describe('ContextStats.record', () => {
 
   it('counts near/over window only when real and win are present', () => {
     const cs = fresh();
-    const t = Date.parse('2026-08-29T21:00:00Z');
+    const t = tHoursAgo(2, 0);
     cs.record({ ts: t, provider: 'a', real: 29700, win: 33000, status: 200 }); // ratio 0.9 → near
     cs.record({ ts: t, provider: 'a', real: 34000, win: 33000, status: 400 }); // real > win → over
     cs.record({ ts: t, provider: 'a', real: 500, win: 0, status: 200 });        // без win → без ratio
@@ -47,7 +57,7 @@ describe('ContextStats.record', () => {
 
   it('accumulates events (compacted, memory, cache, sysShare)', () => {
     const cs = fresh();
-    const t = Date.parse('2026-08-29T22:00:00Z');
+    const t = tHoursAgo(2, 0);
     cs.record({ ts: t, provider: 'b', compacted: true, memory: true, cacheType: 'semcache', sysShare: 0.4, status: 200 });
     cs.record({ ts: t, provider: 'b', cacheType: 'exact', status: 200 });
     const b = cs.snapshot().buckets[0];
@@ -62,9 +72,12 @@ describe('ContextStats.record', () => {
 describe('ContextStats.bucketing', () => {
   it('buckets by hour across providers', () => {
     const cs = fresh();
-    cs.record({ ts: Date.parse('2026-08-29T20:10:00Z'), provider: 'a', status: 200 });
-    cs.record({ ts: Date.parse('2026-08-29T20:40:00Z'), provider: 'a', status: 200 });
-    cs.record({ ts: Date.parse('2026-08-29T21:05:00Z'), provider: 'b', status: 200 });
+    const h1 = tHoursAgo(3, 10);   // час N
+    const h2 = tHoursAgo(3, 40);   // тот же час
+    const h3 = tHoursAgo(2, 5);    // следующий час
+    cs.record({ ts: h1, provider: 'a', status: 200 });
+    cs.record({ ts: h2, provider: 'a', status: 200 });
+    cs.record({ ts: h3, provider: 'b', status: 200 });
     const snap = cs.snapshot();
     assert.equal(snap.buckets.length, 2, 'same hour+provider merge; new hour/provider = new bucket');
     assert.equal(snap.buckets.find(b => b.provider === 'a').requests, 2);
@@ -74,7 +87,7 @@ describe('ContextStats.bucketing', () => {
 describe('ContextStats persistence', () => {
   it('serialize → load round-trips aggregates (not raw)', () => {
     const cs = fresh();
-    cs.record({ ts: Date.parse('2026-08-29T20:10:00Z'), provider: 'x', real: 1000, win: 2000, status: 200 });
+    cs.record({ ts: tHoursAgo(2, 10), provider: 'x', real: 1000, win: 2000, status: 200 });
     const ser = cs.serialize();
     assert.ok(Array.isArray(ser.buckets));
     const cs2 = new ContextStats();
@@ -191,7 +204,7 @@ describe('ContextStats retention', () => {
 
 describe('ContextStats.upgradedCount', () => {
   it('aggregates upgraded from record into bucket/summary', () => {
-    const t = Date.parse('2026-08-30T10:00:00Z');
+    const t = tHoursAgo(2, 0);
     const cs = new ContextStats();
     cs.record({ ts: t, provider: 'a', upgraded: 1, status: 200 });
     cs.record({ ts: t, provider: 'a', upgraded: true, status: 200 });
@@ -204,7 +217,7 @@ describe('ContextStats.upgradedCount', () => {
   });
 
   it('round-trips upgradedCount through serialize → load', () => {
-    const t = Date.parse('2026-08-30T10:00:00Z');
+    const t = tHoursAgo(2, 0);
     const cs = new ContextStats();
     cs.record({ ts: t, provider: 'x', upgraded: 1, status: 200 });
     const cs2 = new ContextStats();
@@ -214,7 +227,7 @@ describe('ContextStats.upgradedCount', () => {
   });
 
   it('tracks task category counts in bucket and summary', () => {
-    const t = Date.parse('2026-08-30T10:00:00Z');
+    const t = tHoursAgo(2, 0);
     const cs = new ContextStats();
     cs.record({ ts: t, provider: 'a', taskCategory: 'coding', status: 200 });
     cs.record({ ts: t, provider: 'a', taskCategory: 'reasoning', status: 200 });
@@ -230,7 +243,7 @@ describe('ContextStats.upgradedCount', () => {
   });
 
   it('round-trips task counts through serialize → load', () => {
-    const t = Date.parse('2026-08-30T10:00:00Z');
+    const t = tHoursAgo(2, 0);
     const cs = new ContextStats();
     cs.record({ ts: t, provider: 'x', taskCategory: 'coding', status: 200 });
     const cs2 = new ContextStats();
@@ -240,7 +253,7 @@ describe('ContextStats.upgradedCount', () => {
   });
 
   it('tracks design task category', () => {
-    const t = Date.parse('2026-08-30T10:00:00Z');
+    const t = tHoursAgo(2, 0);
     const cs = new ContextStats();
     cs.record({ ts: t, provider: 'a', taskCategory: 'design', status: 200 });
     const b = cs.snapshot().buckets[0];
